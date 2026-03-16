@@ -828,6 +828,29 @@ async def cmd_refresh(message):
     await bot.send_message(message.chat.id, "Progress refresh complete")
 
 
+@dp.message_handler(commands=["rebuild"])
+async def cmd_rebuild(message):
+    """Re-import ALL games for every tracked user. Use after long downtime."""
+    if message.chat.id != 46051043:
+        return
+    users = list(users_collection.find())
+    if not users:
+        await bot.send_message(message.chat.id, "No tracked users")
+        return
+    await bot.send_message(message.chat.id, f"Rebuilding games DB for {len(users)} users...")
+    # Reset timestamps so background check won't spam notifications
+    users_collection.update_many({}, {"$set": {"date_added": datetime.now(timezone.utc)}})
+    for user_doc in users:
+        login = user_doc["_id"]
+        try:
+            await asyncio.to_thread(add_all_user_games, login)
+            await bot.send_message(message.chat.id, f"✓ {login}")
+        except Exception as e:
+            logging.error("Error rebuilding %s: %s", login, e)
+            await bot.send_message(message.chat.id, f"✗ {login}: {e}")
+    await bot.send_message(message.chat.id, "Rebuild complete")
+
+
 @dp.message_handler(commands=["psn_search"])
 async def cmd_psn_search(message):
     """Search PSN for users by partial name."""
