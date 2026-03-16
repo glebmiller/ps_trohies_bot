@@ -4,7 +4,7 @@ from psnawp_api.models.trophies import PlatformType, TrophySet
 from time import sleep
 import json
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, executor, types
 import pymongo
 import re
@@ -271,6 +271,21 @@ def _poll_friend_trophies():
                                 break
 
                     notifications.append(received_trophies)
+
+                # Cache platinum if one was just earned
+                has_plat = any(t.get("trophytype") == "PLATINUM" for t in received_trophies[3:])
+                if has_plat:
+                    try:
+                        all_earned = psn_user.trophies(
+                            np_communication_id=np_communication_id,
+                            platform=PlatformType(platform),
+                            include_progress=True,
+                        )
+                        time_spent = sorted([t.earned_date_time for t in all_earned if t.earned_date_time is not None])
+                        time_delta = (time_spent[-1] - time_spent[0]) if len(time_spent) >= 2 else None
+                        cache_platinum(np_communication_id, friend.online_id, progress, time_delta)
+                    except Exception as e:
+                        logging.warning("Failed to cache platinum for %s: %s", friend.online_id, e)
             else:
                 logging.info("no new trophies")
                 break
@@ -467,14 +482,46 @@ def get_title_ids_by_name(name: str) -> List[str]:
     return deduped
 
 
+# cache platinum data for a user in a game document
+def cache_platinum(np_communication_id, user_name, progress, time_delta):
+    """Store platinum status and time-to-finish in the game document."""
+    seconds = int(time_delta.total_seconds()) if time_delta else None
+    all_stats.update_one(
+        {"_id": np_communication_id},
+        {"$set": {f"platinum_cache.{user_name}": {"progress": progress, "time_delta_seconds": seconds}}},
+    )
+    logging.info("Cached platinum for %s in %s (%s seconds)", user_name, np_communication_id, seconds)
+
+
 # check if user has platinum trophy in game
 def check_platinum(game, np_communication_id, platform):
     result = []
     name = game["title"]
+    platinum_cache = game.get("platinum_cache", {})
+
+    # Collect users that need API calls vs cached
+    users_needing_api = []
+    for users in game["user progress"]:
+        for user_name in users.keys():
+            cached = platinum_cache.get(user_name)
+            if cached:
+                # Platinum is permanent — use cached data, but use live progress from DB
+                user_data = [user_name, users[user_name], 1]
+                seconds = cached.get("time_delta_seconds")
+                if seconds is not None:
+                    user_data.append(timedelta(seconds=seconds))
+                result.append(user_data)
+                logging.info("Using cached platinum for %s", user_name)
+            else:
+                users_needing_api.append((user_name, users[user_name]))
+
+    if not users_needing_api:
+        return result
+
+    # Only do title_id lookups if we have users that need API calls
     title_ids = get_title_ids_by_name(name)
     logging.info("title_ids= %s", title_ids)
 
-    # Also try the search API
     if not title_ids:
         try:
             api_title_id = search_title_id(name)
@@ -483,77 +530,70 @@ def check_platinum(game, np_communication_id, platform):
         except Exception as e:
             logging.warning("search API fallback failed: %s", e)
 
-    # reverse title_ids list
     title_ids.reverse()
-
-    # Cache resolved title_id but allow per-user fallback for multi-region SKUs
     shared_title_id = None
 
-    for users in game["user progress"]:
-        for user_name in users.keys():
-            logging.info("user_name = %s", user_name)
-            user_data = [user_name]
-            psn_user = psnawp.user(online_id=user_name)
+    for user_name, db_progress in users_needing_api:
+        logging.info("user_name = %s", user_name)
+        user_data = [user_name]
+        psn_user = psnawp.user(online_id=user_name)
 
-            # Try the shared title_id first; if it fails for this user,
-            # try all title_ids (handles different regional SKUs)
-            user_title_id = None
-            ids_to_try = []
-            if shared_title_id:
-                ids_to_try = [shared_title_id] + [t for t in title_ids if t != shared_title_id]
-            else:
-                ids_to_try = list(title_ids)
+        ids_to_try = []
+        if shared_title_id:
+            ids_to_try = [shared_title_id] + [t for t in title_ids if t != shared_title_id]
+        else:
+            ids_to_try = list(title_ids)
 
-            # Pass all title_ids in one API call instead of trying one at a time
-            user_trophy_info = None
+        user_trophy_info = None
+        user_title_id = None
+        try:
+            for trophy_title_info in psn_user.trophy_titles_for_title(title_ids=ids_to_try):
+                user_title_id = trophy_title_info.title_id if hasattr(trophy_title_info, "title_id") else ids_to_try[0]
+                user_trophy_info = trophy_title_info
+                if shared_title_id is None:
+                    shared_title_id = user_title_id
+                break
+        except Exception:
+            logging.info("No trophies for %s with title_ids %s", user_name, ids_to_try)
+
+        if user_title_id is None or user_trophy_info is None:
+            logging.warning("Could not resolve title_id for %s / %s", user_name, name)
+            user_data.extend([0, 0])
+            result.append(user_data)
+            continue
+
+        logging.info("title_id = %s for user %s", user_title_id, user_name)
+        user_data.append(user_trophy_info.progress)
+
+        earned = user_trophy_info.earned_trophies
+        plat_count = earned.platinum if isinstance(earned, TrophySet) else earned.get("platinum", 0)
+        if plat_count == 1:
+            user_data.append(1)
+            logging.info("Platinum")
+        else:
+            user_data.append(0)
+            user_data.append(0)
+            logging.info("No Platinum")
+
+        if user_data[2] == 1:
+            user_np_comm_id = user_trophy_info.np_communication_id or np_communication_id
+            time_delta = None
             try:
-                for trophy_title_info in psn_user.trophy_titles_for_title(title_ids=ids_to_try):
-                    user_title_id = trophy_title_info.title_id if hasattr(trophy_title_info, "title_id") else ids_to_try[0]
-                    user_trophy_info = trophy_title_info
-                    if shared_title_id is None:
-                        shared_title_id = user_title_id
-                    break
-            except Exception:
-                logging.info("No trophies for %s with title_ids %s", user_name, ids_to_try)
+                game_trophies = psn_user.trophies(
+                    np_communication_id=user_np_comm_id,
+                    platform=PlatformType(platform),
+                    include_progress=True,
+                )
+                time_spent = [t.earned_date_time for t in game_trophies if t.earned_date_time is not None]
+                time_spent = sorted(time_spent)
+                if len(time_spent) >= 2:
+                    time_delta = time_spent[-1] - time_spent[0]
+                    user_data.append(time_delta)
+            except Exception as e:
+                logging.warning("Error getting trophy times for %s: %s", user_name, e)
 
-            if user_title_id is None or user_trophy_info is None:
-                logging.warning("Could not resolve title_id for %s / %s", user_name, name)
-                user_data.extend([0, 0])
-                result.append(user_data)
-                continue
-
-            logging.info("title_id = %s for user %s", user_title_id, user_name)
-
-            # Use progress from the user's own trophy data (handles cross-region)
-            user_data.append(user_trophy_info.progress)
-
-            earned = user_trophy_info.earned_trophies
-            plat_count = earned.platinum if isinstance(earned, TrophySet) else earned.get("platinum", 0)
-            if plat_count == 1:
-                user_data.append(1)
-                logging.info("Platinum")
-            else:
-                user_data.append(0)
-                user_data.append(0)
-                logging.info("No Platinum")
-
-            if user_data[2] == 1:
-                # Use the np_communication_id from the user's trophy info if available,
-                # fall back to the DB one — this handles multi-region SKUs
-                user_np_comm_id = user_trophy_info.np_communication_id or np_communication_id
-                try:
-                    game_trophies = psn_user.trophies(
-                        np_communication_id=user_np_comm_id,
-                        platform=PlatformType(platform),
-                        include_progress=True,
-                    )
-                    time_spent = [t.earned_date_time for t in game_trophies if t.earned_date_time is not None]
-                    time_spent = sorted(time_spent)
-                    if len(time_spent) >= 2:
-                        delta = time_spent[-1] - time_spent[0]
-                        user_data.append(delta)
-                except Exception as e:
-                    logging.warning("Error getting trophy times for %s: %s", user_name, e)
+            # Cache the platinum so we never call the API for this user/game again
+            cache_platinum(np_communication_id, user_name, user_trophy_info.progress, time_delta)
 
         result.append(user_data)
     return result
