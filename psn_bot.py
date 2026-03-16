@@ -76,9 +76,11 @@ def get_user_presence(user) -> str | None:
     return None
 
 
+from pyrate_limiter import Duration, Rate
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-psnawp = PSNAWP(database.getPSNToken())
+psnawp = PSNAWP(database.getPSNToken(), rate_limit=Rate(1, Duration.SECOND * 1))
 
 # connect to db
 mongo_client = pymongo.MongoClient(database.get_mongo_url())
@@ -159,10 +161,15 @@ async def notify_trophies(trophies):
         await asyncio.sleep(5)
 
 
-async def friends_check():
-    # get list of friends
+def _poll_friend_trophies():
+    """Blocking function that polls PSN friends for new trophies.
+
+    Returns a list of (received_trophies_list, ...) batches to notify about.
+    Runs in a thread so it doesn't block the event loop.
+    """
     psn_client = psnawp.me()
     bot_friends = psn_client.friends_list()
+    notifications = []
 
     for friend in bot_friends:
         logging.info("Checking friend: %s", friend.online_id)
@@ -207,29 +214,22 @@ async def friends_check():
                 if all_stats.find_one({"_id": np_communication_id}) is None:
                     add_game_to_collection(np_communication_id, game_name, friend.online_id, progress, platform, icon_url)
                     logging.info(f"{game_name} added to DB")
-                    await asyncio.sleep(0.1)
                 else:
                     update_game_in_collection(np_communication_id, friend.online_id, progress)
                     logging.info(f"{game_name} updated in DB")
-                    await asyncio.sleep(0.1)
 
                 game_trophies = psn_user.trophies(np_communication_id=np_communication_id, platform=PlatformType(platform), include_progress=True)
-                # make dict with this keys username, gamename, platform, trophyname, description, percentage, trophy type, icon
-                # received_trophy = {'trophy_id': None, 'user_name': friend.online_id, 'game_name': game_name, 'platform': platform, 'trophy_name': '', 'description': '', 'percentage': '', 'trophytype': '', 'icon': ''}
 
                 received_trophies = [friend.online_id, game_name, platform]
 
                 for single_trophy in game_trophies:
-                    # print(single_trophy)
-                    if single_trophy.earned_date_time == None:
-                        # go to next iteration if trophy is not earned
+                    if single_trophy.earned_date_time is None:
                         continue
 
                     new_trophy_date = single_trophy.earned_date_time.replace(tzinfo=None)
                     last_trophy_date = last_trophy_date.replace(tzinfo=None)
 
                     if new_trophy_date > last_trophy_date:
-                        # make a dict of new trophies with trophy_id as key, and dict with all info as value. needed info is percentage, trophytype, icon, description
                         received_trophy = {}
                         received_trophy["trophy_id"] = single_trophy.trophy_id
                         received_trophy["percentage"] = single_trophy.trophy_earn_rate
@@ -264,18 +264,25 @@ async def friends_check():
                     )
                     for trophy in all_trophy_names.trophies():
                         for received_trophy in received_trophies[3:]:
-
                             if received_trophy["trophy_id"] == trophy.trophy_id:
                                 received_trophy["trophy_name"] = trophy.trophy_name
                                 received_trophy["description"] = trophy.trophy_detail
                                 received_trophy["icon"] = trophy.trophy_icon_url
                                 break
 
-                    # send message to telegram
-                    await notify_trophies(received_trophies)
+                    notifications.append(received_trophies)
             else:
                 logging.info("no new trophies")
                 break
+
+    return notifications
+
+
+async def friends_check():
+    """Poll friends for new trophies in a thread, then send notifications."""
+    notifications = await asyncio.to_thread(_poll_friend_trophies)
+    for received_trophies in notifications:
+        await notify_trophies(received_trophies)
 
 
 # check if user in DB
@@ -497,19 +504,17 @@ def check_platinum(game, np_communication_id, platform):
             else:
                 ids_to_try = list(title_ids)
 
+            # Pass all title_ids in one API call instead of trying one at a time
             user_trophy_info = None
-            for try_title_id in ids_to_try:
-                try:
-                    for trophy_title_info in psn_user.trophy_titles_for_title(title_ids=[try_title_id]):
-                        user_title_id = try_title_id
-                        user_trophy_info = trophy_title_info
-                        if shared_title_id is None:
-                            shared_title_id = try_title_id
-                        break
-                except Exception:
-                    logging.info("No trophies for %s with title_id %s", user_name, try_title_id)
-                if user_title_id is not None:
+            try:
+                for trophy_title_info in psn_user.trophy_titles_for_title(title_ids=ids_to_try):
+                    user_title_id = trophy_title_info.title_id if hasattr(trophy_title_info, "title_id") else ids_to_try[0]
+                    user_trophy_info = trophy_title_info
+                    if shared_title_id is None:
+                        shared_title_id = user_title_id
                     break
+            except Exception:
+                logging.info("No trophies for %s with title_ids %s", user_name, ids_to_try)
 
             if user_title_id is None or user_trophy_info is None:
                 logging.warning("Could not resolve title_id for %s / %s", user_name, name)
@@ -670,7 +675,7 @@ async def cmd_find(message):
         await bot.send_message(message.chat.id, "Game not found")
     elif len(result) == 1:
         game = result[0]
-        games_dict = compose_answer(game)
+        games_dict = await asyncio.to_thread(compose_answer, game)
         answer = f"{games_dict['title']} {games_dict['platform'][0]}\n\n\n{games_dict['users']}"
         logging.info(answer)
         logging.info(games_dict)
@@ -702,7 +707,7 @@ async def cmd_find(message):
         # if games_list_grouped has only one game, send it
         if len(games_list_grouped) == 1:
             game = games_list_grouped[0]
-            games_dict = compose_answer_group(game["ids"])
+            games_dict = await asyncio.to_thread(compose_answer_group, game["ids"])
             # games_dict = compose_answer(game)
             answer = f"{games_dict['title']} {' '.join(games_dict['platform'])}\n\n\n{games_dict['users']}"
             #!!!!compose_answer_group
@@ -738,7 +743,7 @@ async def process_callback_button1(callback_query: types.CallbackQuery):
             await bot.answer_callback_query(callback_query.id)
             return
         # if game found
-        games_dict = compose_answer(game)
+        games_dict = await asyncio.to_thread(compose_answer, game)
         answer = f"{games_dict['title']} {games_dict['platform'][0]}\n\n\n{games_dict['users']}"
 
         await bot.send_photo(callback_query.message.chat.id, game["image"], answer)
@@ -748,7 +753,7 @@ async def process_callback_button1(callback_query: types.CallbackQuery):
         game = all_stats.find_one({"_id": list_of_ids[0]})
 
         # print(callback_query.data)
-        games_dict = compose_answer_group(list_of_ids)
+        games_dict = await asyncio.to_thread(compose_answer_group, list_of_ids)
         # games_dict = compose_answer(game)
         answer = f"{games_dict['title']} {' '.join(games_dict['platform'])}\n\n\n{games_dict['users']}"
         if answer is None:
