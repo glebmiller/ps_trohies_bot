@@ -81,7 +81,7 @@ logging.basicConfig(level=logging.INFO)
 psnawp = PSNAWP(database.getPSNToken())
 
 # connect to db
-mongo_client = pymongo.MongoClient("mongodb://localhost:27017")
+mongo_client = pymongo.MongoClient(database.get_mongo_url())
 db = mongo_client.PSNTrophies_new
 
 # general table without trophy names
