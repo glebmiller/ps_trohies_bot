@@ -538,6 +538,7 @@ def check_platinum(game, np_communication_id, platform):
         user_data = [user_name]
         psn_user = psnawp.user(online_id=user_name)
 
+        # Try title_id-based lookup first (gives progress + earned_trophies in one call)
         ids_to_try = []
         if shared_title_id:
             ids_to_try = [shared_title_id] + [t for t in title_ids if t != shared_title_id]
@@ -546,27 +547,43 @@ def check_platinum(game, np_communication_id, platform):
 
         user_trophy_info = None
         user_title_id = None
-        try:
-            for trophy_title_info in psn_user.trophy_titles_for_title(title_ids=ids_to_try):
-                user_title_id = trophy_title_info.title_id if hasattr(trophy_title_info, "title_id") else ids_to_try[0]
-                user_trophy_info = trophy_title_info
-                if shared_title_id is None:
-                    shared_title_id = user_title_id
-                break
-        except Exception:
-            logging.info("No trophies for %s with title_ids %s", user_name, ids_to_try)
+        game_trophies = None
+        if ids_to_try:
+            try:
+                for trophy_title_info in psn_user.trophy_titles_for_title(title_ids=ids_to_try):
+                    user_title_id = trophy_title_info.title_id if hasattr(trophy_title_info, "title_id") else ids_to_try[0]
+                    user_trophy_info = trophy_title_info
+                    if shared_title_id is None:
+                        shared_title_id = user_title_id
+                    break
+            except Exception:
+                logging.info("No trophies for %s with title_ids %s", user_name, ids_to_try)
 
-        if user_title_id is None or user_trophy_info is None:
-            logging.warning("Could not resolve title_id for %s / %s", user_name, name)
-            user_data.extend([0, 0])
-            result.append(user_data)
-            continue
+        if user_trophy_info is not None:
+            # Got data from title_id lookup
+            user_data.append(user_trophy_info.progress)
+            earned = user_trophy_info.earned_trophies
+            plat_count = earned.platinum if isinstance(earned, TrophySet) else earned.get("platinum", 0)
+        else:
+            # Fallback: use np_communication_id directly to check platinum
+            logging.info("No title_id for %s / %s, falling back to np_communication_id", user_name, name)
+            user_data.append(db_progress)
+            plat_count = 0
+            try:
+                game_trophies = list(
+                    psn_user.trophies(
+                        np_communication_id=np_communication_id,
+                        platform=PlatformType(platform),
+                        include_progress=True,
+                    )
+                )
+                for t in game_trophies:
+                    if t.trophy_type.name == "PLATINUM" and t.earned_date_time is not None:
+                        plat_count = 1
+                        break
+            except Exception as e:
+                logging.warning("Fallback trophy check failed for %s: %s", user_name, e)
 
-        logging.info("title_id = %s for user %s", user_title_id, user_name)
-        user_data.append(user_trophy_info.progress)
-
-        earned = user_trophy_info.earned_trophies
-        plat_count = earned.platinum if isinstance(earned, TrophySet) else earned.get("platinum", 0)
         if plat_count == 1:
             user_data.append(1)
             logging.info("Platinum")
@@ -576,14 +593,19 @@ def check_platinum(game, np_communication_id, platform):
             logging.info("No Platinum")
 
         if user_data[2] == 1:
-            user_np_comm_id = user_trophy_info.np_communication_id or np_communication_id
+            user_np_comm_id = (user_trophy_info.np_communication_id if user_trophy_info else None) or np_communication_id
             time_delta = None
             try:
-                game_trophies = psn_user.trophies(
-                    np_communication_id=user_np_comm_id,
-                    platform=PlatformType(platform),
-                    include_progress=True,
-                )
+                if game_trophies is None:
+                    # Need to fetch trophies for time calculation
+                    game_trophies = list(
+                        psn_user.trophies(
+                            np_communication_id=user_np_comm_id,
+                            platform=PlatformType(platform),
+                            include_progress=True,
+                        )
+                    )
+                # else: game_trophies already fetched in fallback above
                 time_spent = [t.earned_date_time for t in game_trophies if t.earned_date_time is not None]
                 time_spent = sorted(time_spent)
                 if len(time_spent) >= 2:
