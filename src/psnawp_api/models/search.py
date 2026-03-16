@@ -111,7 +111,7 @@ class Search:
                     "featureFlags": {"isSpartacusEnabled": True},
                 }
             ],
-            "countryCode": "us",
+            "countryCode": "ru",
             "languageCode": "en",
             "age": 99,
         }

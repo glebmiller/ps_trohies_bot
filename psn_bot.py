@@ -1,5 +1,8 @@
 
 from psnawp_api import PSNAWP
+#from psnawp_api import PSNAWP
+
+from psnawp_api.models.search import Search
 from time import sleep
 import json
 from enum import Enum
@@ -18,15 +21,34 @@ import csv
 from typing import List
 from itertools import groupby, chain
 
+def levenshtein_distance(s1, s2):
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+
+    return previous_row[-1]
+
+# Пример использования
+print(levenshtein_distance("кот", "скат"))
+
 
 class TrophyType(Enum):
     BRONZE = 'bronze'
     SILVER = 'silver'
     GOLD = 'gold',
     PLATINUM = 'platinum'
-
-
-#from telegram import ParseMode
 
 
 def cmdline(command):
@@ -38,13 +60,13 @@ def cmdline(command):
 logging.basicConfig(level=logging.INFO)
 psnawp = PSNAWP(database.getPSNToken())
 
-# подключаемся к БД
+# connect to db
 client = pymongo.MongoClient("mongodb://localhost:27017")
 db = client.PSNTrophies_new
 
-# общая таблица без названий трофеев
+# general table without trophy names
 all_stats = db.games
-# таблица пользователей
+# users' table
 users_collection = db.users
 
 # таблица игр со списком трофеев с названиями
@@ -61,7 +83,7 @@ dp = Dispatcher(bot)
 
 # sending formatted html to telegram
 async def send_to_chat(url, game_name, platform, user_name, platinum=False):
-    os.system(f"sudo cp {url} /var/www/tutorial/{url}")
+    os.system(f"sudo cp {url} /var/www/millertech/{url}")
     result = f"{user_name} -<a href='{AMAZON_URL}{url}'> {game_name}</a> - {platform.upper()}"
     print(result)
     await bot.send_message(CHATID, result, parse_mode=types.ParseMode.HTML)
@@ -77,6 +99,9 @@ async def make_html(trophies):
     print(trophies)
     
     for trophy in trophies[3:]:
+        #update last user update time in users collection
+        users_collection.update_one({"_id": trophies[0]}, {"$set": {"date_added": datetime.now(timezone.utc)}})
+    
         plat = False
         if trophy['trophytype'] == "PLATINUM":
             plat = True
@@ -102,8 +127,8 @@ async def make_html(trophies):
             file.write(content)
             file.close()
         await send_to_chat(url, game_name=trophies[1], platform=trophies[2], user_name=trophies[0], platinum=plat)
-    #update last user update time in users collection
-    users_collection.update_one({"_id": trophies[0]}, {"$set": {"date_added": datetime.now(timezone.utc)}})
+        sleep(5)
+    
 
 async def friends_check():
     # get list of friends
@@ -112,21 +137,29 @@ async def friends_check():
 
     for friend in bot_friends:
         print(friend.online_id)
-        #if friend.online_id in ['gorcheque', 'gleb_miller', 'GingerKrololo']:
-
-        #check when friend got last trophy recorded in DB
-        #last_trophy_date = all_stats.find_one({"_id": friend.online_id}, sort=[("date", -1)])
-        # get date_added from users collection
         last_trophy_date = users_collection.find_one({"_id": friend.online_id})['date_added']
         print(last_trophy_date)
         
-
-
-
         #get new trophies since last trophy recorded in DB
         client = psnawp.user(online_id=friend.online_id)
         for trophy_title in client.trophy_titles(limit=3):
             print(trophy_title)
+            print(trophy_title.title_name)
+            try:
+                # Assuming `psnawp` is an instance of the class containing the `search` method
+                search_obj = psnawp.search()
+
+                # Now `search_obj` is an instance of `Search` class, and you can call its methods
+                title_id_api = search_obj.get_title_id(title_name=trophy_title.title_name)  # Assuming `get_title_id` is a method of `Search` class
+
+                
+                
+                print('api search id =', title_id_api)
+            except Exception as e:
+                print("api search error", e )
+                print()
+        
+            
             last_updated_date_time = trophy_title.last_updated_date_time
             #compare last trophy date in DB with last trophy date in PSN
             # fix can't compare offset-naive and offset-aware datetimes error
@@ -166,11 +199,7 @@ async def friends_check():
                         # go to next iteration if trophy is not earned
                         continue
 
-                    # fix TypeError: can't compare offset-naive and offset-aware datetimes error
-                    #single_trophy.earned_date_time = single_trophy.earned_date_time.replace(tzinfo=None)
-                    # fix     raise FrozenInstanceError()attr.exceptions.FrozenInstanceError 
-                    #print("single_trophy.earned_date_time", type(single_trophy.earned_date_time))
-                    #print("last_trophy_date", type(last_trophy_date))
+                  
                     new_trophy_date = single_trophy.earned_date_time.replace(tzinfo=None)
                     last_trophy_date = last_trophy_date.replace(tzinfo=None)
 
@@ -201,12 +230,14 @@ async def friends_check():
                     if title_id is not None:
                         break
                 print("title_id", title_id)
+                try:
+                    print('api search id =', psnawp.search.get_title_id(trophy_title.title_name))
+                except Exception as e:
+                    print("api search error", e )
+                    print()
                 if title_id is not None:
                     all_trophy_names = psnawp.game_title(title_id=title_id, account_id=friend.account_id, np_communication_id=np_communication_id)
-                    #for trophy in zxc:
-                    #print(zall_trophy_namesxc.trophies(platform="PS5"))
                     for trophy in all_trophy_names.trophies(platform=platform):
-                        #print(received_trophies)
                         for received_trophy in received_trophies[3:]:
                             
                             if received_trophy['trophy_id'] == trophy.trophy_id:
@@ -256,50 +287,14 @@ def add_game_to_collection(
     all_stats.insert_one(values)
 
 # update game in collection all_stats
-def update_game_in_collection(npCommunicationId, login, progress):
-    #replace user progress with new one
-    # replace user progress with new one
-    
+def update_game_in_collection(npCommunicationId, login, progress):    
     all_stats.update_one(
                 {"_id": npCommunicationId}, {"$pull": {"user progress": {login: {"$exists": True}}}}
             )
     all_stats.update_one(
         {"_id": npCommunicationId}, {"$push": {"user progress": {login: progress}}}
     )
-    """
-
-    all_stats.update_one(
-    {"_id": npCommunicationId},
-    [
-        {
-            "$set": {
-                f"user progress.$[elem].{login}": {
-                    "$cond": {
-                        "if": {"$eq": [{"$ifNull": [f"$user progress.$[elem].{login}", None]}, None]},
-                        "then": progress,
-                        "else": {"$mergeObjects": [f"$user progress.$[elem].{login}", progress]}
-                    }
-                }
-            }
-        },
-        {
-            "$pull": {
-                "user progress": {
-                    f"$or": [
-                        {login: {"$exists": False}},
-                        {login: None},
-                        {login: {}}
-                    ]
-                }
-            }
-        }
-    ],
-    array_filters=[{"elem.login": {"$eq": login}}]
-    )
-    """
-
     
-
 
 # adds percentage stats to table for 1 user
 def add_all_user_games(login):
@@ -326,30 +321,6 @@ def add_all_user_games(login):
         sleep(0.5)
     print(f"all {login}'s games added to DB")
         
-
-"""# add user to DB
-@dp.message_handler(commands=["add"])
-async def add(message):
-    login = message.text.split()[1]
-    #login = extract_arg(message.text)
-
-    user_account_id = psnawp.user(online_id=login)
-    friend = user_account_id.friendship()
-    print(f"{login} is {friend['friendRelation']}")
-    if friend["friendRelation"] == "friend": # and not check_if_user_in_db(login):
-        await bot.send_message(message.chat.id, f"adding {login} to DB")
-        add_user(login)
-        # load games to collection
-        add_all_user_games(login)
-
-    elif friend["friendRelation"] == "friend" and check_if_user_in_db(login):
-        await bot.send_message(message.chat.id, f"{login} alredy in DB")
-    else:
-        await bot.send_message(
-            message.chat.id, "Become friends with MillerUSACC first!"
-        )
-
-"""
 
 # add user to DB
 @dp.message_handler(commands=["add"])
@@ -381,13 +352,7 @@ def find_game(game):
     # result = []
     res = all_stats.find(query)
     return list(res)
-"""
-# write a function to find a game in the database by np_communication_id
-def find_game_by_id(np_communication_id):
-    query = {"_id": np_communication_id}
-    res = all_stats.find(query)
-    return list(res)
-"""
+
 
 
 # подготовить список из данных одной игры
@@ -401,23 +366,35 @@ def make_single_list(list_of_games):
 
 # get title ids by name from csv file
 def get_title_ids_by_name(name: str) -> List[str]:
+    if name == 'Alan Wake II':
+        name = 'Alan Wake 2'
     # in name remove ® and ™
     name = name.replace('®', '')
     name = name.replace('™', '')
+    name = name.replace('’', "'")
+
     #remove spaces and new lines from name
     name = name.strip()
 
 
     title_ids = []
-    with open('/home/ubuntu/Projects/Python/psn_2.0/psnawp/PlayStation-Titles/All_Titles.tsv', newline='') as tsvfile:
+    with open('/home/ubuntu/Projects/Bots/psn_bot/PlayStation-Titles/All_Titles.tsv', newline='') as tsvfile:
         reader = csv.DictReader(tsvfile, delimiter='\t')
         for row in reader:
             # remove ® and ™ from row['name']
             row['name'] = row['name'].replace('®', '')
             row['name'] = row['name'].replace('™', '')
+            row['name'] = row['name'].replace('’', "'")
 
-            if name.lower() in row['name'].lower():
+            if name.lower() in row['name'].lower() or (levenshtein_distance(name.lower(), row['name'].lower()) < 4):
                 title_ids.append(row['titleId'])
+            if name.lower() == "warhammer - chaosbane":
+                title_ids.append("PPSA01445_00")
+                title_ids.append("PPSA01446_00")
+                title_ids.append("PPSA01447_00")
+                title_ids.append("PPSA11410_00")
+
+    #print("title_ids found in tsv file: ", title_ids)
     return title_ids
 
 
@@ -427,7 +404,9 @@ def check_platinum(game, np_communication_id, platform):
     name = game['title']
     title_id = None
     title_ids = get_title_ids_by_name(name)
-    print(title_ids)
+    print('title_ids= ', title_ids)
+    #print('api search id =', psnawp.search.get_title_id(name))
+
     # reverse title_ids list
     title_ids.reverse()
 
@@ -437,6 +416,75 @@ def check_platinum(game, np_communication_id, platform):
             print()
             user_data = [user_name]
             client = psnawp.user(online_id=user_name)
+            if not title_id:
+                for try_title_id in title_ids:
+                    print("title_id =", title_id)
+                    print()
+                    try:
+                        for trophy_title_info in client.trophy_titles_for_title(title_ids=[try_title_id]):
+                            print("id found")
+                            print(try_title_id)
+                            title_id = try_title_id
+                            break
+                    except:
+                        print("exeption No trophies for this game")
+                        print()
+                    if title_id is not None:
+                        break
+
+
+            print("title_id =", title_id)
+            if game['title'] == 'HEAVY RAIN™':
+                title_id = 'NPEK00216'
+            
+            for trophy_title_info in client.trophy_titles_for_title(title_ids=[title_id]):
+                user_data.append(trophy_title_info.progress)
+                print("trophy_title_info =", trophy_title_info)
+                print()
+
+                if trophy_title_info.earned_trophies['platinum'] == 1:
+                    user_data.append(1)
+                    print("Platinum")
+                else:
+                    user_data.append(0)
+                    user_data.append(0)
+                    print("No Platinum")
+                if user_data[2] == 1:
+                    print(np_communication_id)
+                    print(platform)
+                    try:
+                        game_trophies = client.trophies(np_communication_id=np_communication_id, platform=platform, include_metadata=False)
+                        time_spent = []
+                        for single_trophy in game_trophies:
+                            time_spent.append(single_trophy.earned_date_time)
+                        #delete None values
+                        time_spent = [x for x in time_spent if x is not None]
+                        time_spent = sorted(time_spent)
+                        #calculate delta of time between first and last trophy
+                        delta = time_spent[-1] - time_spent[0]
+                        user_data.append(delta)
+                    except:
+                        pass
+                        
+        result.append(user_data)
+    return result
+"""
+def check_platinum(game, np_communication_id, platform):
+    result = []
+    name = game['title']
+    #title_id = None
+    #title_ids = get_title_ids_by_name(name)
+    #print(title_ids)
+    # reverse title_ids list
+    #title_ids.reverse()
+
+    for users in game['user progress']:
+        for user_name in users.keys():
+            print("user_name =", user_name)
+            print()
+            user_data = [user_name]
+            client = psnawp.user(online_id=user_name)
+            
             if not title_id:
                 for try_title_id in title_ids:
                     #print("title_id =", title_id)
@@ -452,9 +500,10 @@ def check_platinum(game, np_communication_id, platform):
                         print()
                     if title_id is not None:
                         break
+                    
 
-
-            print(title_id)
+            title_id = np_communication_id
+            print()
                 
             
             for trophy_title_info in client.trophy_titles_for_title(title_ids=[title_id]):
@@ -488,107 +537,6 @@ def check_platinum(game, np_communication_id, platform):
                         
         result.append(user_data)
     return result
-
-"""
-#check if user has platinum trophy in game
-def check_platinum(game):
-    logging.debug("Getting title IDs for game: %s", game["title"])
-
-    title_ids = get_title_ids_by_name(game["title"])
-    print(title_ids)
-    result = []
-    title_id = None
-    for user_data in game["user progress"]:
-        user_name = next(iter(user_data))
-        logging.debug("Retrieving data for user: %s", user_name)
-
-        client = psnawp.user(online_id=user_name)
-        print(user_name)
-        #print(client)
-
-        # Find trophy title with matching ID
-        if not title_id:       
-            for try_title_id in title_ids:
-                try:
-                    for trophy_title_info in client.trophy_titles_for_title(title_ids=[try_title_id]):
-                        #print(trophy_title_info.title_name)
-                        #print(game['title'])
-                        if trophy_title_info.title_name == game['title']:
-                            #print("id found")
-                            #print(try_title_id)
-                            title_id = try_title_id
-                except:
-                    logging.debug("No trophies for title ID: %s", try_title_id)
-                    #print("exeption No trophies for this game123123123")
-
-                if title_id:
-                    logging.debug("Title ID found: %s", title_id)
-                    break
-
-            if not title_id:
-                logging.debug("No matching title ID found for user: %s, game: %s", user_name, game["title"])
-                print("exeption No trophies for this game")
-                continue
-            
-
-        user_progress = [user_name]
-        #print(user_progress)
-        try:
-            trophy_title_info = next(iter(client.trophy_titles_for_title(title_ids=[title_id])))
-            #trophy_title_info = client.trophy_titles_for_title(title_ids=[title_id])[0]
-        except:
-            logging.debug("No trophy progress for title ID: %s", title_id)
-            continue
-
-        user_progress.append(trophy_title_info.progress)
-        #print(user_progress)
-
-        np_communication_id = trophy_title_info.np_communication_id
-        game_platform = next(iter(trophy_title_info.title_platform)).value
-
-        platinum_trophy = trophy_title_info.earned_trophies["platinum"]
-        user_progress.append(1 if platinum_trophy else 0)
-        #print(user_progress)
-        platforms = ["PS3", "PS4", "PS5", "PS Vita", "UNKNOWN"]
-        if platinum_trophy:
-            try:
-                game_trophies = client.trophies(np_communication_id=np_communication_id, platform=game_platform, include_metadata=False)
-                trophy_dates = [t.earned_date_time for t in game_trophies if t.earned_date_time]
-                if trophy_dates:
-                    user_progress.append(max(trophy_dates) - min(trophy_dates))
-                else:
-                    logging.debug("No trophy dates found for user: %s, game: %s", user_name, game["title"])
-            except:
-                    
-
-
-
-                for platform in platforms:
-                    #make try except expression for each platform, stop when no exception
-                    try:
-                        game_trophies = client.trophies(np_communication_id=np_communication_id, platform=platform, include_metadata=False)
-                        trophy_dates = [t.earned_date_time for t in game_trophies if t.earned_date_time]
-                        if trophy_dates:
-                            user_progress.append(max(trophy_dates) - min(trophy_dates))
-                        else:
-                            logging.debug("No trophy dates found for user: %s, game: %s", user_name, game["title"])
-                        break
-                    except:
-                        print("No trophies for this game")
-                    print()
-            
-                
-            #print(user_progress)
-
-            #game_trophies = client.trophies(np_communication_id=np_communication_id, platform="PS5", include_metadata=False)
-            
-        else:
-            user_progress += [0, None]
-        #print(user_progress)
-        result.append(user_progress)
-
-    return result
-
 """
 def make_str_with_progress_and_emoji(sorted_list, sorted_platinum_hunters):
     str_with_progress_and_emoji = ''
@@ -633,25 +581,6 @@ def compose_answer(game):
 
     users = ''
     users = make_str_with_progress_and_emoji(sorted_list, sorted_platinum_hunters)
-    """
-    for item in sorted_list:
-        fire = ''
-        animal = ''
-        if item[2] == 1:
-            fire = '🏆'
-            if item[3].days == sorted_platinum_hunters[0][3].days:
-                animal = '🐇'
-            elif item[3].days == sorted_platinum_hunters[-1][3].days:
-                animal = '🐢'
-
-        users += f"{item[0]}: {item[1]}{fire}{animal}\n"
-    """
-    # format the game data as a string
-    #game_string = f"{game['title']} {game['title platform']}"
-
-    # combine the game and user progress data into a final string
-    #final_string = f"{game_string}\n\n{users}"
-    #return final_string
     print(users)
     return  {"title": game['title'], "platform": [game['title platform']], "users": users, 'sorted_platinum_hunters': sorted_platinum_hunters, 'sorted_other_users': sorted_other_users}
 
@@ -734,12 +663,7 @@ async def find(message):
         else:
             await bot.send_photo(message.chat.id, game['image'], answer)
     else:
-        #await bot.send_message(message.chat.id, "more than 1 game found")
-        # make inline keyboard with found games and versions, send np_communication_id to callback
-
-        #check if result has multiple versions of the same game with different platforms
-        # if yes, make lists of games with the same title and different platform and _id
-        #print(result)
+        
         games_by_title = {}
         for game in result:
             title = game['title']
@@ -830,78 +754,43 @@ async def process_callback_button1(callback_query: types.CallbackQuery):
 
 @dp.message_handler(commands=["test"])
 async def test(message):
-    """
-    np_communication_id = "NPWR21586_00"
-                #get platform
-    platform = "PS5"
-    client = psnawp.user(online_id="gleb_miller")
-    title_id = ''
-    get_trophy_summary_for_title = client.trophies.trophy_titles.get_trophy_summary_for_title(np_communication_id=np_communication_id, platform=platform)
-    game_trophies = client.trophies(np_communication_id=np_communication_id, platform=platform, include_metadata=False)
-    get_trophy_summary_for_title = psnawp.trophy_titles.get_trophy_summary_for_title(np_communication_id=np_communication_id, platform=platform)
-     
-    for single_trophy in game_trophies:
-        print(single_trophy)
-        print(single_trophy.earned_date_time)
-        #print(single_trophy.trophy_title_name)
-        #print(single_trophy.trophy_title_detail)
-        print(single_trophy.trophy_icon_url)
-        print(single_trophy.earned)
-        #print(single_trophy.earned_rate)
-        #print(single_trophy.earned_rate_percentage)
     
-    for title in get_trophy_summary_for_title:
-        print(title)
-
-    #client = psnawp.me()
-    for trophy_title in client.trophy_titles_for_title(title_ids=['PPSA01750_00']):
-        print(trophy_title)
-    print()
-    #trophies = client.title_stats(limit=200)
-    #for trophy in trophies:
-    #    print(trophy)
-    #trophies = client.e
-    trophies = client.trophy_summary()
-    #for trophy in trophies:
-    print(trophies)
-    print()
-    qwe = client.trophy_groups_summary(np_communication_id=np_communication_id, platform=platform)
-    
-    print(qwe)
-    print()
-
-
-    asd = client.trophies(np_communication_id=np_communication_id, platform=platform, include_metadata=False)
-    for trophy in asd:
-        print(trophy)
-        print()
-    print()
-    
-
-    zxc = psnawp.game_title(title_id='PPSA01750_00', account_id='7534350400202456599', np_communication_id=np_communication_id)
-    #for trophy in zxc:
-    print(zxc.trophies(platform="PS5"))
-    for trophy in zxc.trophies(platform="PS5"):
-        print(trophy)
-        print()
-    print()
-    #print(zxc.get_details())
-    print()
-    #print(zxc.trophy_groups_summary(platform="PS5"))
-    print()
-    for trophy_title in client.trophy_titles(limit=1):
-        print(trophy_title)
-    """
     #await send_to_chat('2023-04-2814:17:57.212988.html', game_name="Sackboy", platform="PS4", user_name="gorcheque", platinum=False)
-    await friends_check()
+    res = users_collection.find()
+    for i in res:
+        print(i)
+
+    res = all_stats.find()
+    for i in res[:2]:
+        print(i)
+    #await friends_check()
             
 
 @dp.message_handler(commands=["erase"])
 async def erase(message):
-    all_stats.delete_many({})
-    users_collection.delete_many({})
-    await bot.send_message(message.chat.id, "DB erased")
+    if message.chat.id == 46051043:
+        all_stats.delete_many({})
+        users_collection.delete_many({})
+        await bot.send_message(message.chat.id, "DB erased")
 
+def delete_user(username):
+
+    # Remove the user from the first collection
+    all_stats.update_many({}, {"$pull": {"user progress": {username: {"$exists": True}}}})
+
+
+    # Remove the user from the second collection
+    users_collection.delete_one({"_id": username})
+
+    print(f"User {username} deleted from both tables.")
+
+
+# add user to DB
+@dp.message_handler(commands=["del"])
+async def add(message):
+    if message.chat.id == 46051043:
+        login = message.text.split()[1]
+        delete_user(login)
 
 
 async def background_on_start() -> None:
