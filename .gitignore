@@ -1,6 +1,5 @@
 # My files
 .idea
-database.py
 test.py
 src/psnawp
 .github/workflows/code_coverage.yaml
