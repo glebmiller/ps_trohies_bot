@@ -1,100 +1,188 @@
+"""Provides TitleStats class for retrieving a user's statistics on played titles and games."""
+
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional, Iterator, Any
+from typing import TYPE_CHECKING, Any, Final, Literal
 
-from attrs import define
+from typing_extensions import Self, override
 
-from psnawp_api.core.psnawp_exceptions import PSNAWPForbidden
-from psnawp_api.utils.endpoints import BASE_PATH, API_PATH
-from psnawp_api.utils.misc import iso_format_to_datetime, play_duration_to_timedelta
-from psnawp_api.utils.request_builder import RequestBuilder
+from psnawp_api.models.listing import PaginationIterator
+from psnawp_api.utils.endpoints import API_PATH, BASE_PATH
+from psnawp_api.utils.misc import iso_format_to_datetime
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from psnawp_api.core import Authenticator
+    from psnawp_api.models.listing import PaginationArguments
 
 
 class PlatformCategory(Enum):
+    """Represents the PlayStation platform associated with title."""
+
     UNKNOWN = "unknown"
     PS4 = "ps4_game"
     PS5 = "ps5_native_game"
 
+    @classmethod
+    def _missing_(cls, value: object) -> Literal[PlatformCategory.UNKNOWN]:
+        _ = value
+        return cls.UNKNOWN
 
-def platform_str_to_enum(platform_type_str: Optional[str]) -> PlatformCategory:
-    return PlatformCategory(platform_type_str) if platform_type_str is not None else PlatformCategory.UNKNOWN
+
+PT_REGEX: Final[re.Pattern[str]] = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
 
 
-@define(frozen=True)
+def play_duration_to_timedelta(play_duration: str | None) -> timedelta:
+    """Provides a timedelta object for the play duration PSN sends. If for some reason the string is malformed or None, timedelta will return 0.
+
+    Valid patters: PT243H18M48S, PT21M18S, PT18H, PT18H20S, PT4H21M
+
+    :param play_duration: String from API
+
+    :returns: String parsed into a timedelta object
+
+    .. note::
+
+        PSN API returns the duration in this format: PT243H18M48S. The maximum time Unit is Hours, it does not extend to
+        Days or Months.
+
+    """
+    hours = 0
+    minutes = 0
+    seconds = 0
+
+    if play_duration:
+        match = re.search(PT_REGEX, play_duration)
+        if not match:
+            return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+        hours = int(match.group(1)) if match.group(1) else 0
+        minutes = int(match.group(2)) if match.group(2) else 0
+        seconds = int(match.group(3)) if match.group(3) else 0
+
+    return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
+@dataclass(frozen=True)
 class TitleStats:
-    """A class that represents a PlayStation Video Game Play Time Stats."""
+    """A class that represents a PlayStation Video Game Play Time Stats.
 
-    # Title and Stats Data
-    title_id: Optional[str]
+    .. note::
+
+        This class is intended to be used via PSNAWP.
+
+    """
+
+    title_id: str | None
     "Game title id"
-    name: Optional[str]
+    name: str | None
     "Game title name"
-    image_url: Optional[str]
+    image_url: str | None
     "Image URL"
-    category: Optional[PlatformCategory]
+    category: PlatformCategory | None
     "Category/Platform Type"
-    play_count: Optional[int]
+    play_count: int | None
     "Number of times the game has been played"
-    first_played_date_time: Optional[datetime]
+    first_played_date_time: datetime | None
     "First time the game was played"
-    last_played_date_time: Optional[datetime]
+    last_played_date_time: datetime | None
     "Last time the game was played"
-    play_duration: Optional[timedelta]
+    play_duration: timedelta | None
     "Total time the game has been played. Example: PT1H51M21S"
-    total_items_count: Optional[int]
-    "Total Number of Titles a user own"
 
     @classmethod
     def from_dict(cls, game_stats_dict: dict[str, Any]) -> TitleStats:
-        title_instance = cls(
+        """Creates an instance of :py:class:`TitleStats` from a dictionary."""
+        return cls(
             title_id=game_stats_dict.get("titleId"),
             name=game_stats_dict.get("name"),
             image_url=game_stats_dict.get("imageUrl"),
-            category=platform_str_to_enum(game_stats_dict.get("category")),
+            category=PlatformCategory(game_stats_dict.get("category")),
             play_count=game_stats_dict.get("playCount"),
-            first_played_date_time=iso_format_to_datetime(game_stats_dict.get("firstPlayedDateTime")),
-            last_played_date_time=iso_format_to_datetime(game_stats_dict.get("lastPlayedDateTime")),
-            play_duration=play_duration_to_timedelta(game_stats_dict.get("playDuration")),
-            total_items_count=game_stats_dict.get("totalItemCount"),
+            first_played_date_time=iso_format_to_datetime(
+                game_stats_dict.get("firstPlayedDateTime"),
+            ),
+            last_played_date_time=iso_format_to_datetime(
+                game_stats_dict.get("lastPlayedDateTime"),
+            ),
+            play_duration=play_duration_to_timedelta(
+                game_stats_dict.get("playDuration"),
+            ),
         )
-        return title_instance
+
+
+class TitleStatsIterator(PaginationIterator[TitleStats]):
+    """An iterator for fetching and paginating through TitleStats objects from the PlayStation Network API.
+
+    .. note::
+
+        This class is intended to be used via Client or User class. See
+        :py:meth:`psnawp_api.models.client.Client.title_stats` or :py:meth:`psnawp_api.models.user.User.title_stats`.
+
+    """
+
+    def __init__(
+        self,
+        authenticator: Authenticator,
+        url: str,
+        pagination_args: PaginationArguments,
+    ) -> None:
+        """Init for TitleStatsIterator."""
+        super().__init__(
+            authenticator=authenticator,
+            url=url,
+            pagination_args=pagination_args,
+        )
+
+    @override
+    def fetch_next_page(self) -> Generator[TitleStats, None, None]:
+        """Fetches the next page of TitleStats objects from the API.
+
+        :yield: A generator yielding TitleStats objects.
+
+        """
+        response = self.authenticator.get(
+            url=self._url,
+            params=self._pagination_args.get_params_dict(),
+        ).json()
+        self._total_item_count = response.get("totalItemCount", 0)
+
+        titles: list[dict[str, Any]] = response.get("titles")
+        for title in titles:
+            title_instance = TitleStats.from_dict(title)
+            self._pagination_args.increment_offset()
+            yield title_instance
+
+        offset = response.get("nextOffset") or 0
+        if offset > 0:
+            self._has_next = True
+        else:
+            self._has_next = False
 
     @classmethod
-    def from_endpoint(cls, request_builder: RequestBuilder, account_id: str, limit: Optional[int]) -> Iterator[TitleStats]:
+    def from_endpoint(
+        cls,
+        authenticator: Authenticator,
+        account_id: str,
+        pagination_args: PaginationArguments,
+    ) -> Self:
+        """Creates an instance of TitleStatsIterator from the given endpoint.
 
-        offset = 0
-        limit_per_page = min(limit, 500) if limit is not None else 500
-        params: dict[str, Any] = {"categories": "ps4_game,ps5_native_game", "limit": limit_per_page, "offset": offset}
+        :param authenticator: The Authenticator instance used for making authenticated requests to the API.
+        :param account_id: The account ID for which to fetch title stats.
+        :param pagination_args: Arguments for handling pagination, including limit, offset, and page size.
 
-        while True:
-            params["offset"] = offset
-            try:
-                response = request_builder.get(
-                    url=f"{BASE_PATH['games_list']}{API_PATH['user_game_data'].format(account_id=account_id)}",
-                    params=params,
-                ).json()
-            except PSNAWPForbidden as forbidden:
-                raise PSNAWPForbidden("The following user has made their profile private.") from forbidden
+        :returns: An instance of TitleStatsIterator.
 
-            titles: list[dict[str, Any]] = response.get("titles")
-
-            per_page_items = 0
-            for title in titles:
-                title_instance = TitleStats.from_dict({**title, "totalItemCount": response.get("totalItemCount")})
-                yield title_instance
-                per_page_items += 1
-
-            if limit is not None:
-                limit -= per_page_items
-                params["limit"] = min(limit, limit_per_page)
-
-                # If limit is reached
-                if limit <= 0:
-                    break
-
-            offset = response.get("nextOffset") or 0
-            # If there is not more offset, we've reached the end
-            if offset <= 0:
-                break
+        """
+        url = f"{BASE_PATH['games_list']}{API_PATH['user_game_data'].format(account_id=account_id)}"
+        return cls(
+            authenticator=authenticator,
+            url=url,
+            pagination_args=pagination_args,
+        )
