@@ -615,7 +615,8 @@ def check_platinum(game, np_communication_id, platform):
                 logging.warning("Error getting trophy times for %s: %s", user_name, e)
 
             # Cache the platinum so we never call the API for this user/game again
-            cache_platinum(np_communication_id, user_name, user_trophy_info.progress, time_delta)
+            cached_progress = user_trophy_info.progress if user_trophy_info else db_progress
+            cache_platinum(np_communication_id, user_name, cached_progress, time_delta)
 
         result.append(user_data)
     return result
