@@ -218,7 +218,7 @@ def _poll_friend_trophies():
                     update_game_in_collection(np_communication_id, friend.online_id, progress)
                     logging.info(f"{game_name} updated in DB")
 
-                game_trophies = psn_user.trophies(np_communication_id=np_communication_id, platform=PlatformType(platform), include_progress=True)
+                game_trophies = list(psn_user.trophies(np_communication_id=np_communication_id, platform=PlatformType(platform), include_progress=True))
 
                 received_trophies = [friend.online_id, game_name, platform]
 
@@ -270,22 +270,15 @@ def _poll_friend_trophies():
                                 received_trophy["icon"] = trophy.trophy_icon_url
                                 break
 
+                if len(received_trophies) > 3:
                     notifications.append(received_trophies)
 
-                # Cache platinum if one was just earned
+                # Cache platinum if one was just earned (reuse game_trophies already fetched)
                 has_plat = any(t.get("trophytype") == "PLATINUM" for t in received_trophies[3:])
                 if has_plat:
-                    try:
-                        all_earned = psn_user.trophies(
-                            np_communication_id=np_communication_id,
-                            platform=PlatformType(platform),
-                            include_progress=True,
-                        )
-                        time_spent = sorted([t.earned_date_time for t in all_earned if t.earned_date_time is not None])
-                        time_delta = (time_spent[-1] - time_spent[0]) if len(time_spent) >= 2 else None
-                        cache_platinum(np_communication_id, friend.online_id, progress, time_delta)
-                    except Exception as e:
-                        logging.warning("Failed to cache platinum for %s: %s", friend.online_id, e)
+                    time_spent = sorted([t.earned_date_time for t in game_trophies if t.earned_date_time is not None])
+                    time_delta = (time_spent[-1] - time_spent[0]) if len(time_spent) >= 2 else None
+                    cache_platinum(np_communication_id, friend.online_id, progress, time_delta)
             else:
                 logging.info("no new trophies")
                 break
@@ -384,6 +377,28 @@ def add_all_user_games(login):
             update_game_in_collection(np_communication_id, login, progress)
             logging.info(f"{game_name} updated in DB")
             sleep(0.1)
+
+        # Cache platinum if earned
+        earned = trophy_title.earned_trophies
+        plat_count = earned.platinum if isinstance(earned, TrophySet) else earned.get("platinum", 0)
+        if plat_count == 1:
+            # Check if already cached to avoid redundant trophy list fetch
+            existing = all_stats.find_one({"_id": np_communication_id})
+            already_cached = existing and existing.get("platinum_cache", {}).get(login)
+            if not already_cached:
+                time_delta = None
+                try:
+                    game_trophies = psn_user.trophies(
+                        np_communication_id=np_communication_id,
+                        platform=PlatformType(platform),
+                        include_progress=True,
+                    )
+                    time_spent = sorted([t.earned_date_time for t in game_trophies if t.earned_date_time is not None])
+                    if len(time_spent) >= 2:
+                        time_delta = time_spent[-1] - time_spent[0]
+                except Exception as e:
+                    logging.warning("Error caching platinum time for %s / %s: %s", login, game_name, e)
+                cache_platinum(np_communication_id, login, progress, time_delta)
 
         sleep(0.5)
     logging.info(f"all {login}'s games added to DB")
@@ -493,132 +508,23 @@ def cache_platinum(np_communication_id, user_name, progress, time_delta):
     logging.info("Cached platinum for %s in %s (%s seconds)", user_name, np_communication_id, seconds)
 
 
-# check if user has platinum trophy in game
+# check if user has platinum trophy in game (DB-only, no API calls)
 def check_platinum(game, np_communication_id, platform):
     result = []
-    name = game["title"]
     platinum_cache = game.get("platinum_cache", {})
 
-    # Collect users that need API calls vs cached
-    users_needing_api = []
     for users in game["user progress"]:
-        for user_name in users.keys():
+        for user_name, progress in users.items():
             cached = platinum_cache.get(user_name)
             if cached:
-                # Platinum is permanent — use cached data, but use live progress from DB
-                user_data = [user_name, users[user_name], 1]
+                user_data = [user_name, progress, 1]
                 seconds = cached.get("time_delta_seconds")
                 if seconds is not None:
                     user_data.append(timedelta(seconds=seconds))
                 result.append(user_data)
-                logging.info("Using cached platinum for %s", user_name)
             else:
-                users_needing_api.append((user_name, users[user_name]))
+                result.append([user_name, progress, 0, 0])
 
-    if not users_needing_api:
-        return result
-
-    # Only do title_id lookups if we have users that need API calls
-    title_ids = get_title_ids_by_name(name)
-    logging.info("title_ids= %s", title_ids)
-
-    if not title_ids:
-        try:
-            api_title_id = search_title_id(name)
-            if api_title_id:
-                title_ids.append(api_title_id)
-        except Exception as e:
-            logging.warning("search API fallback failed: %s", e)
-
-    title_ids.reverse()
-    shared_title_id = None
-
-    for user_name, db_progress in users_needing_api:
-        logging.info("user_name = %s", user_name)
-        user_data = [user_name]
-        psn_user = psnawp.user(online_id=user_name)
-
-        # Try title_id-based lookup first (gives progress + earned_trophies in one call)
-        ids_to_try = []
-        if shared_title_id:
-            ids_to_try = [shared_title_id] + [t for t in title_ids if t != shared_title_id]
-        else:
-            ids_to_try = list(title_ids)
-
-        user_trophy_info = None
-        user_title_id = None
-        game_trophies = None
-        if ids_to_try:
-            try:
-                for trophy_title_info in psn_user.trophy_titles_for_title(title_ids=ids_to_try):
-                    user_title_id = trophy_title_info.title_id if hasattr(trophy_title_info, "title_id") else ids_to_try[0]
-                    user_trophy_info = trophy_title_info
-                    if shared_title_id is None:
-                        shared_title_id = user_title_id
-                    break
-            except Exception:
-                logging.info("No trophies for %s with title_ids %s", user_name, ids_to_try)
-
-        if user_trophy_info is not None:
-            # Got data from title_id lookup
-            user_data.append(user_trophy_info.progress)
-            earned = user_trophy_info.earned_trophies
-            plat_count = earned.platinum if isinstance(earned, TrophySet) else earned.get("platinum", 0)
-        else:
-            # Fallback: use np_communication_id directly to check platinum
-            logging.info("No title_id for %s / %s, falling back to np_communication_id", user_name, name)
-            user_data.append(db_progress)
-            plat_count = 0
-            try:
-                game_trophies = list(
-                    psn_user.trophies(
-                        np_communication_id=np_communication_id,
-                        platform=PlatformType(platform),
-                        include_progress=True,
-                    )
-                )
-                for t in game_trophies:
-                    if t.trophy_type.name == "PLATINUM" and t.earned_date_time is not None:
-                        plat_count = 1
-                        break
-            except Exception as e:
-                logging.warning("Fallback trophy check failed for %s: %s", user_name, e)
-
-        if plat_count == 1:
-            user_data.append(1)
-            logging.info("Platinum")
-        else:
-            user_data.append(0)
-            user_data.append(0)
-            logging.info("No Platinum")
-
-        if user_data[2] == 1:
-            user_np_comm_id = (user_trophy_info.np_communication_id if user_trophy_info else None) or np_communication_id
-            time_delta = None
-            try:
-                if game_trophies is None:
-                    # Need to fetch trophies for time calculation
-                    game_trophies = list(
-                        psn_user.trophies(
-                            np_communication_id=user_np_comm_id,
-                            platform=PlatformType(platform),
-                            include_progress=True,
-                        )
-                    )
-                # else: game_trophies already fetched in fallback above
-                time_spent = [t.earned_date_time for t in game_trophies if t.earned_date_time is not None]
-                time_spent = sorted(time_spent)
-                if len(time_spent) >= 2:
-                    time_delta = time_spent[-1] - time_spent[0]
-                    user_data.append(time_delta)
-            except Exception as e:
-                logging.warning("Error getting trophy times for %s: %s", user_name, e)
-
-            # Cache the platinum so we never call the API for this user/game again
-            cached_progress = user_trophy_info.progress if user_trophy_info else db_progress
-            cache_platinum(np_communication_id, user_name, cached_progress, time_delta)
-
-        result.append(user_data)
     return result
 
 
@@ -738,7 +644,7 @@ async def cmd_find(message):
         await bot.send_message(message.chat.id, "Game not found")
     elif len(result) == 1:
         game = result[0]
-        games_dict = await asyncio.to_thread(compose_answer, game)
+        games_dict = compose_answer(game)
         answer = f"{games_dict['title']} {games_dict['platform'][0]}\n\n\n{games_dict['users']}"
         logging.info(answer)
         logging.info(games_dict)
@@ -770,8 +676,7 @@ async def cmd_find(message):
         # if games_list_grouped has only one game, send it
         if len(games_list_grouped) == 1:
             game = games_list_grouped[0]
-            games_dict = await asyncio.to_thread(compose_answer_group, game["ids"])
-            # games_dict = compose_answer(game)
+            games_dict = compose_answer_group(game["ids"])
             answer = f"{games_dict['title']} {' '.join(games_dict['platform'])}\n\n\n{games_dict['users']}"
             #!!!!compose_answer_group
             if answer is None:
@@ -806,7 +711,7 @@ async def process_callback_button1(callback_query: types.CallbackQuery):
             await bot.answer_callback_query(callback_query.id)
             return
         # if game found
-        games_dict = await asyncio.to_thread(compose_answer, game)
+        games_dict = compose_answer(game)
         answer = f"{games_dict['title']} {games_dict['platform'][0]}\n\n\n{games_dict['users']}"
 
         await bot.send_photo(callback_query.message.chat.id, game["image"], answer)
@@ -815,9 +720,7 @@ async def process_callback_button1(callback_query: types.CallbackQuery):
     else:
         game = all_stats.find_one({"_id": list_of_ids[0]})
 
-        # print(callback_query.data)
-        games_dict = await asyncio.to_thread(compose_answer_group, list_of_ids)
-        # games_dict = compose_answer(game)
+        games_dict = compose_answer_group(list_of_ids)
         answer = f"{games_dict['title']} {' '.join(games_dict['platform'])}\n\n\n{games_dict['users']}"
         if answer is None:
             await bot.send_message(callback_query.message.chat.id, "No trophies for this game")
@@ -912,6 +815,64 @@ async def cmd_rebuild(message):
             logging.error("Error rebuilding %s: %s", login, e)
             await bot.send_message(message.chat.id, f"✗ {login}: {e}")
     await bot.send_message(message.chat.id, "Rebuild complete")
+
+
+def _cache_platinums_for_user(login):
+    """Scan a user's trophy titles and cache any uncached platinums. Returns count cached."""
+    psn_user = psnawp.user(online_id=login)
+    cached_count = 0
+    for trophy_title in psn_user.trophy_titles(limit=None):
+        earned = trophy_title.earned_trophies
+        plat_count = earned.platinum if isinstance(earned, TrophySet) else earned.get("platinum", 0)
+        if plat_count != 1:
+            continue
+        np_comm_id = trophy_title.np_communication_id
+        platform = next(iter(trophy_title.title_platform)).value
+        progress = trophy_title.progress
+        # Skip if already cached
+        game_doc = all_stats.find_one({"_id": np_comm_id}, {"platinum_cache": 1})
+        if game_doc and game_doc.get("platinum_cache", {}).get(login):
+            continue
+        # Fetch trophies only for this uncached platinum
+        time_delta = None
+        try:
+            game_trophies = psn_user.trophies(
+                np_communication_id=np_comm_id,
+                platform=PlatformType(platform),
+                include_progress=True,
+            )
+            time_spent = sorted([t.earned_date_time for t in game_trophies if t.earned_date_time is not None])
+            if len(time_spent) >= 2:
+                time_delta = time_spent[-1] - time_spent[0]
+        except Exception as e:
+            logging.warning("Error getting trophy times for %s / %s: %s", login, np_comm_id, e)
+        cache_platinum(np_comm_id, login, progress, time_delta)
+        cached_count += 1
+        sleep(0.5)
+    return cached_count
+
+
+@dp.message_handler(commands=["cache"])
+async def cmd_cache(message):
+    """Scan all tracked users and cache any uncached platinum trophies (fast — skips already cached)."""
+    if message.chat.id != 46051043:
+        return
+    users = list(users_collection.find())
+    if not users:
+        await bot.send_message(message.chat.id, "No tracked users")
+        return
+    await bot.send_message(message.chat.id, f"Caching platinums for {len(users)} users...")
+    total = 0
+    for user_doc in users:
+        login = user_doc["_id"]
+        try:
+            count = await asyncio.to_thread(_cache_platinums_for_user, login)
+            total += count
+            await bot.send_message(message.chat.id, f"✓ {login}: {count} new")
+        except Exception as e:
+            logging.error("Error caching platinums for %s: %s", login, e)
+            await bot.send_message(message.chat.id, f"✗ {login}: {e}")
+    await bot.send_message(message.chat.id, f"Done — cached {total} platinums")
 
 
 @dp.message_handler(commands=["psn_search"])
