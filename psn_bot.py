@@ -218,7 +218,9 @@ def _poll_friend_trophies():
                     update_game_in_collection(np_communication_id, friend.online_id, progress)
                     logging.info(f"{game_name} updated in DB")
 
-                game_trophies = list(psn_user.trophies(np_communication_id=np_communication_id, platform=PlatformType(platform), include_progress=True))
+                game_trophies = list(
+                    psn_user.trophies(np_communication_id=np_communication_id, platform=PlatformType(platform), include_progress=True, trophy_group_id="all")
+                )
 
                 received_trophies = [friend.online_id, game_name, platform]
 
@@ -392,6 +394,7 @@ def add_all_user_games(login):
                         np_communication_id=np_communication_id,
                         platform=PlatformType(platform),
                         include_progress=True,
+                        trophy_group_id="all",
                     )
                     time_spent = sorted([t.earned_date_time for t in game_trophies if t.earned_date_time is not None])
                     if len(time_spent) >= 2:
@@ -840,6 +843,7 @@ def _cache_platinums_for_user(login):
                 np_communication_id=np_comm_id,
                 platform=PlatformType(platform),
                 include_progress=True,
+                trophy_group_id="all",
             )
             time_spent = sorted([t.earned_date_time for t in game_trophies if t.earned_date_time is not None])
             if len(time_spent) >= 2:
