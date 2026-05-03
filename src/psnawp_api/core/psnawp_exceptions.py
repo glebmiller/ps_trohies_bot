@@ -21,9 +21,11 @@ class PSNAWPError(Exception):
             pass
         else:
             err = error.get("error", {})
+            if not isinstance(err, dict):
+                err = {}
             self.reference_id = err.get("referenceId")
             self.code = err.get("code")
-            self.message = err.get("message")
+            self.message = err.get("message") or error.get("error_description")
 
         super().__init__(self.message or response)
 
