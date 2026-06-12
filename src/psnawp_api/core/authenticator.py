@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 from typing_extensions import NotRequired, ParamSpec, Unpack
 
-from psnawp_api.core.psnawp_exceptions import PSNAWPAuthenticationError
+from psnawp_api.core.psnawp_exceptions import PSNAWPAuthenticationError, PSNAWPClientError
 from psnawp_api.core.request_builder import RequestBuilder
 from psnawp_api.utils import API_PATH, BASE_PATH
 
@@ -44,7 +44,13 @@ def pre_request_processing(method: Callable[PT, RT]) -> Callable[PT, RT]:
             authorization_code = authenticator_obj.get_authorization_code()
             authenticator_obj.fetch_access_token_from_authorization(authorization_code)
         else:
-            authenticator_obj.fetch_access_token_from_refresh()
+            try:
+                authenticator_obj.fetch_access_token_from_refresh()
+            except PSNAWPClientError:
+                # Refresh token expired; fall back to re-authenticating via NPSSO cookie
+                authenticator_obj.token_response = None
+                authorization_code = authenticator_obj.get_authorization_code()
+                authenticator_obj.fetch_access_token_from_authorization(authorization_code)
 
         return method(*method_args, **method_kwargs)
 

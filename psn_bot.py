@@ -46,14 +46,20 @@ def search_title_id(title_name: str) -> str | None:
     """
     try:
         for result in psnawp.search(search_query=title_name, search_domain=SearchDomain.FULL_GAMES, limit=3):
-            # result["id"] format: "conceptId:productId" e.g. "201930:UP1004-CUSA00419_00-GTAVDIGITALDOWNL"
-            result_id = result.get("id", "")
-            # Try to extract CUSA/PPSA style title_id from the product portion
-            parts = result_id.split(":")
-            if len(parts) >= 2:
-                product_id = parts[1]
-                # Extract title_id pattern like CUSA00419_00 or PPSA01234_00
-                match = re.search(r"((?:CUSA|PPSA|NPWR)\d+_\d+)", product_id)
+            if result is None:
+                continue
+            # The product ID with CUSA/PPSA is in the nested result field
+            inner = result.get("result") or {}
+            candidate_ids = []
+            if inner.get("__typename") == "Product":
+                candidate_ids.append(inner.get("id", ""))
+            elif inner.get("__typename") == "Concept":
+                default_product = inner.get("defaultProduct") or {}
+                candidate_ids.append(default_product.get("id", ""))
+            # Also check the top-level id as fallback
+            candidate_ids.append(result.get("id", ""))
+            for candidate in candidate_ids:
+                match = re.search(r"((?:CUSA|PPSA|NPWR)\d+_\d+)", candidate)
                 if match:
                     return match.group(1)
     except Exception as e:
