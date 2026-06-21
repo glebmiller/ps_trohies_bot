@@ -17,6 +17,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import csv
 from typing import List
 from itertools import groupby, chain
+from statistics import mean
 
 
 def levenshtein_distance(s1, s2):
@@ -99,6 +100,11 @@ users_collection = db.users
 
 # temporary store for callback data that exceeds Telegram's 64-byte limit
 _callback_store = {}
+_cache_lock = asyncio.Lock()
+_psn_job_lock = asyncio.Lock()
+DAILY_CACHE_HOUR_UTC = 4
+AUTOPOP_PLATINUM_MAX_SECONDS = 60 * 60
+FASTEST_PLATINUM_MIN_SECONDS = 60 * 60
 
 
 def _store_callback_data(data: str) -> str:
@@ -115,6 +121,138 @@ def _resolve_callback_data(data: str) -> str:
     if data.startswith("cb:"):
         return _callback_store.get(data, data)
     return data
+
+
+def _clean_username_arg(value: str) -> str:
+    return value.strip().strip("'\"")
+
+
+def _resolve_tracked_login(login: str) -> str | None:
+    """Return the stored PSN username, matching case-insensitively if needed."""
+    login = _clean_username_arg(login)
+    if not login:
+        return None
+    user_doc = users_collection.find_one({"_id": login}, {"_id": 1})
+    if user_doc:
+        return user_doc["_id"]
+    user_doc = users_collection.find_one({"_id": re.compile(f"^{re.escape(login)}$", re.IGNORECASE)}, {"_id": 1})
+    return user_doc["_id"] if user_doc else None
+
+
+def _link_telegram_user(login: str, message) -> None:
+    """Remember which Telegram user added/claimed a tracked PSN username."""
+    if not message.from_user:
+        return
+    update = {
+        "telegram_user_id": message.from_user.id,
+        "telegram_chat_id": message.chat.id,
+    }
+    if message.from_user.username:
+        update["telegram_username"] = message.from_user.username
+    users_collection.update_one({"_id": login}, {"$set": update})
+
+
+def _resolve_me_login(message) -> str | None:
+    if message.from_user:
+        user_doc = users_collection.find_one({"telegram_user_id": message.from_user.id}, {"_id": 1})
+        if user_doc:
+            return user_doc["_id"]
+        if message.from_user.username:
+            return _resolve_tracked_login(message.from_user.username)
+    return None
+
+
+def _platform_name(platform) -> str:
+    return str(platform or "").upper().replace(" ", "")
+
+
+def _normalize_title_for_crossgen(title: str | None) -> str:
+    value = (title or "").lower()
+    value = re.sub(r"\b(?:ps4|ps5|playstation\s*[45])\b", " ", value)
+    value = re.sub(r"\b(?:remastered|director'?s cut|definitive|complete|ultimate|standard|deluxe|goty)\s+edition\b", " ", value)
+    value = re.sub(r"\b(?:remastered|director'?s cut)\b", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
+
+
+def _games_by_normalized_title(games):
+    games_by_title = {}
+    for game in games:
+        normalized_title = _normalize_title_for_crossgen(game.get("title"))
+        if normalized_title:
+            games_by_title.setdefault(normalized_title, []).append(game)
+    return games_by_title
+
+
+def _load_crossgen_context(games):
+    context = {game.get("_id"): game for game in games if game is not None}
+    normalized_titles = {_normalize_title_for_crossgen(game.get("title")) for game in games if game is not None}
+    normalized_titles.discard("")
+    for game in games:
+        title = game.get("title")
+        if not title:
+            continue
+        for candidate in all_stats.find({"title": title}):
+            context[candidate.get("_id")] = candidate
+    if normalized_titles:
+        for candidate in all_stats.find({}, {"_id": 1, "title": 1, "title platform": 1, "platinum_cache": 1}):
+            if _normalize_title_for_crossgen(candidate.get("title")) in normalized_titles:
+                context[candidate.get("_id")] = candidate
+    return list(context.values())
+
+
+def _is_crossgen_autopop_platinum(game, login, games_by_normalized_title) -> bool:
+    if _platform_name(game.get("title platform")) != "PS5":
+        return False
+
+    platinum = game.get("platinum_cache", {}).get(login)
+    if not platinum:
+        return False
+
+    seconds = platinum.get("time_delta_seconds")
+    if seconds is None or seconds > AUTOPOP_PLATINUM_MAX_SECONDS:
+        return False
+
+    normalized_title = _normalize_title_for_crossgen(game.get("title"))
+    for candidate in games_by_normalized_title.get(normalized_title, []):
+        if candidate.get("_id") == game.get("_id"):
+            continue
+        if _platform_name(candidate.get("title platform")) == "PS4" and candidate.get("platinum_cache", {}).get(login):
+            return True
+    return False
+
+
+def _platinum_duration(row):
+    if len(row) > 3 and isinstance(row[3], timedelta):
+        return row[3]
+    return None
+
+
+def _platinum_sort_seconds(row):
+    duration = _platinum_duration(row)
+    return duration.total_seconds() if duration is not None else float("inf")
+
+
+def _is_rankable_platinum_seconds(seconds) -> bool:
+    return seconds is not None and seconds >= FASTEST_PLATINUM_MIN_SECONDS
+
+
+def _is_rankable_platinum_row(row) -> bool:
+    duration = _platinum_duration(row)
+    return duration is not None and duration.total_seconds() >= FASTEST_PLATINUM_MIN_SECONDS and not _is_autopop_row(row)
+
+
+def _mark_autopop_row(row, is_autopop):
+    while len(row) < 4:
+        row.append(None)
+    if len(row) == 4:
+        row.append(is_autopop)
+    else:
+        row[4] = is_autopop
+
+
+def _is_autopop_row(row) -> bool:
+    return len(row) > 4 and row[4] is True
 
 
 # таблица игр со списком трофеев с названиями
@@ -366,6 +504,144 @@ def refresh_all_progress(login):
     logging.info("Progress refresh complete for %s", login)
 
 
+def _progress_for_user(game, login):
+    """Return a user's stored progress for a game document."""
+    for user_entry in game.get("user progress", []):
+        if login in user_entry:
+            return user_entry[login]
+    return None
+
+
+def _format_timedelta(seconds):
+    if seconds is None:
+        return None
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    if days:
+        return f"{days}d {hours}h"
+    return f"{hours}h"
+
+
+def _build_user_stats(login):
+    """Build DB-backed stats for a tracked PSN username."""
+    user_doc = users_collection.find_one({"_id": login})
+    if user_doc is None:
+        return None
+
+    games = list(all_stats.find({"user progress": {"$elemMatch": {login: {"$exists": True}}}}))
+    games_by_normalized_title = _games_by_normalized_title(_load_crossgen_context(games))
+    if not games:
+        return {
+            "login": login,
+            "played_games": 0,
+            "platinums": 0,
+            "completed_games": 0,
+            "in_progress_games": 0,
+            "not_started_games": 0,
+            "average_progress": 0,
+            "highest_progress": [],
+            "lowest_progress": [],
+            "platform_counts": {},
+            "fastest_platinum": None,
+            "slowest_platinum": None,
+            "last_seen": user_doc.get("date_added"),
+        }
+
+    progress_rows = []
+    platform_counts = {}
+    platinum_rows = []
+
+    for game in games:
+        progress = _progress_for_user(game, login)
+        if progress is None:
+            continue
+        platform = game.get("title platform", "?")
+        platform_counts[platform] = platform_counts.get(platform, 0) + 1
+        progress_rows.append(
+            {
+                "title": game.get("title", "Unknown game"),
+                "platform": platform,
+                "progress": progress,
+            }
+        )
+        platinum = game.get("platinum_cache", {}).get(login)
+        if platinum:
+            autopop = _is_crossgen_autopop_platinum(game, login, games_by_normalized_title)
+            platinum_rows.append(
+                {
+                    "title": game.get("title", "Unknown game"),
+                    "platform": platform,
+                    "seconds": platinum.get("time_delta_seconds"),
+                    "autopop": autopop,
+                }
+            )
+
+    completed_games = [row for row in progress_rows if row["progress"] == 100]
+    in_progress_games = [row for row in progress_rows if 0 < row["progress"] < 100]
+    not_started_games = [row for row in progress_rows if row["progress"] == 0]
+    highest_progress = sorted(in_progress_games, key=lambda row: row["progress"], reverse=True)[:3]
+    lowest_progress = sorted(in_progress_games, key=lambda row: row["progress"])[:3]
+    timed_platinums = [row for row in platinum_rows if _is_rankable_platinum_seconds(row["seconds"]) and not row["autopop"]]
+
+    return {
+        "login": login,
+        "played_games": len(progress_rows),
+        "platinums": len(platinum_rows),
+        "completed_games": len(completed_games),
+        "in_progress_games": len(in_progress_games),
+        "not_started_games": len(not_started_games),
+        "average_progress": round(mean([row["progress"] for row in progress_rows]), 1) if progress_rows else 0,
+        "highest_progress": highest_progress,
+        "lowest_progress": lowest_progress,
+        "platform_counts": dict(sorted(platform_counts.items())),
+        "fastest_platinum": min(timed_platinums, key=lambda row: row["seconds"]) if timed_platinums else None,
+        "slowest_platinum": max(timed_platinums, key=lambda row: row["seconds"]) if timed_platinums else None,
+        "last_seen": user_doc.get("date_added"),
+    }
+
+
+def _format_stats(stats):
+    lines = [
+        f"Stats for {stats['login']}",
+        "",
+        f"Played games: {stats['played_games']}",
+        f"Platinums: {stats['platinums']}",
+        f"100% games: {stats['completed_games']}",
+        f"In progress: {stats['in_progress_games']}",
+        f"Not started: {stats['not_started_games']}",
+        f"Average progress: {stats['average_progress']}%",
+    ]
+
+    if stats["platform_counts"]:
+        platform_text = ", ".join(f"{platform}: {count}" for platform, count in stats["platform_counts"].items())
+        lines.append(f"Platforms: {platform_text}")
+
+    if stats["fastest_platinum"]:
+        fastest = stats["fastest_platinum"]
+        lines.append(f"Fastest platinum: {fastest['title']} ({_format_timedelta(fastest['seconds'])})")
+    if stats["slowest_platinum"] and stats["slowest_platinum"] != stats["fastest_platinum"]:
+        slowest = stats["slowest_platinum"]
+        lines.append(f"Slowest platinum: {slowest['title']} ({_format_timedelta(slowest['seconds'])})")
+
+    if stats["highest_progress"]:
+        lines.append("")
+        lines.append("Closest unfinished:")
+        for row in stats["highest_progress"]:
+            lines.append(f"- {row['title']} ({row['platform']}): {row['progress']}%")
+
+    if stats["lowest_progress"]:
+        lines.append("")
+        lines.append("Lowest started:")
+        for row in stats["lowest_progress"]:
+            lines.append(f"- {row['title']} ({row['platform']}): {row['progress']}%")
+
+    if stats["last_seen"]:
+        lines.append("")
+        lines.append(f"Last trophy checkpoint: {stats['last_seen'].strftime('%Y-%m-%d %H:%M UTC')}")
+
+    return "\n".join(lines)
+
+
 # adds percentage stats to table for 1 user (blocking — run via asyncio.to_thread)
 def add_all_user_games(login):
 
@@ -421,7 +697,7 @@ async def cmd_add(message):
         await bot.send_message(message.chat.id, "Usage: /add <PSN username>")
         return
     try:
-        login = parts[1]
+        login = _clean_username_arg(parts[1])
         user_account_id = psnawp.user(online_id=login)
         friend = user_account_id.friendship()
         friend_relation = friend["friendRelation"]
@@ -430,9 +706,11 @@ async def cmd_add(message):
             if not check_if_user_in_db(login):
                 await bot.send_message(message.chat.id, f"Adding {login} to DB")
                 add_user(login)
+                _link_telegram_user(login, message)
                 await asyncio.to_thread(add_all_user_games, login)
                 await bot.send_message(message.chat.id, f"{login} added successfully")
             else:
+                _link_telegram_user(login, message)
                 await bot.send_message(message.chat.id, f"{login} already in DB")
         else:
             await bot.send_message(message.chat.id, "Become friends with MillerUSACC first!")
@@ -521,6 +799,7 @@ def cache_platinum(np_communication_id, user_name, progress, time_delta):
 def check_platinum(game, np_communication_id, platform):
     result = []
     platinum_cache = game.get("platinum_cache", {})
+    games_by_normalized_title = _games_by_normalized_title(_load_crossgen_context([game]))
 
     for users in game["user progress"]:
         for user_name, progress in users.items():
@@ -530,6 +809,7 @@ def check_platinum(game, np_communication_id, platform):
                 seconds = cached.get("time_delta_seconds")
                 if seconds is not None:
                     user_data.append(timedelta(seconds=seconds))
+                _mark_autopop_row(user_data, _is_crossgen_autopop_platinum(game, user_name, games_by_normalized_title))
                 result.append(user_data)
             else:
                 result.append([user_name, progress, 0, 0])
@@ -542,11 +822,11 @@ def make_str_with_progress_and_emoji(sorted_list, sorted_platinum_hunters):
     for item in sorted_list:
         fire = ""
         animal = ""
-        if item[2] == 1 and len(item) > 3 and sorted_platinum_hunters:
+        if item[2] == 1 and _platinum_duration(item) is not None and sorted_platinum_hunters and not _is_autopop_row(item):
             fire = "🏆"
-            if item[3].days == sorted_platinum_hunters[0][3].days:
+            if _platinum_duration(item) == _platinum_duration(sorted_platinum_hunters[0]):
                 animal = "🐇"
-            elif item[3].days == sorted_platinum_hunters[-1][3].days:
+            elif _platinum_duration(item) == _platinum_duration(sorted_platinum_hunters[-1]):
                 animal = "🐢"
         elif item[2] == 1:
             fire = "🏆"
@@ -574,12 +854,14 @@ def compose_answer(game):
     logging.info("platinum_hunters = %s", platinum_hunters)
     logging.info("other_users = %s", other_users)
 
-    sorted_platinum_hunters = sorted(platinum_hunters, key=lambda x: x[3].days) if platinum_hunters else []
+    ranked_platinum_hunters = [item for item in platinum_hunters if _is_rankable_platinum_row(item)]
+    unranked_platinum_hunters = [item for item in platinum_hunters if item not in ranked_platinum_hunters]
+    sorted_platinum_hunters = sorted(ranked_platinum_hunters, key=_platinum_sort_seconds) + unranked_platinum_hunters
     sorted_other_users = sorted(other_users, key=lambda x: x[1], reverse=True)
 
     sorted_list = sorted_platinum_hunters + sorted_other_users
 
-    users = make_str_with_progress_and_emoji(sorted_list, sorted_platinum_hunters)
+    users = make_str_with_progress_and_emoji(sorted_list, ranked_platinum_hunters)
     logging.info(users)
     return {
         "title": game["title"],
@@ -596,9 +878,9 @@ def compose_answer_group(games_ids: list = []):
     for game_id in games_ids:
 
         query = {"_id": game_id}
-        res = all_stats.find(query)
-        if res is not None:
-            group_result.append(compose_answer(res[0]))
+        game = all_stats.find_one(query)
+        if game is not None:
+            group_result.append(compose_answer(game))
 
     logging.info("group_result = %s", group_result)
     for item in group_result:
@@ -625,12 +907,14 @@ def compose_answer_group(games_ids: list = []):
     # Sort the grouped records by the time it took the fastest platinum hunter to get the platinum
     sorted_platinum_hunters = group_result[0]["sorted_platinum_hunters"]
     sorted_other_users = group_result[0]["sorted_other_users"]
-    sorted_platinum_hunters = sorted(sorted_platinum_hunters, key=lambda x: x[3].days) if sorted_platinum_hunters else []
+    ranked_platinum_hunters = [item for item in sorted_platinum_hunters if _is_rankable_platinum_row(item)]
+    unranked_platinum_hunters = [item for item in sorted_platinum_hunters if item not in ranked_platinum_hunters]
+    sorted_platinum_hunters = sorted(ranked_platinum_hunters, key=_platinum_sort_seconds) + unranked_platinum_hunters
     sorted_other_users = sorted(sorted_other_users, key=lambda x: x[1], reverse=True)
 
     sorted_list = sorted_platinum_hunters + sorted_other_users
 
-    users = make_str_with_progress_and_emoji(sorted_list, sorted_platinum_hunters)
+    users = make_str_with_progress_and_emoji(sorted_list, ranked_platinum_hunters)
     return {
         "title": group_result[0]["title"],
         "platform": group_result[0]["platform"],
@@ -862,27 +1146,52 @@ def _cache_platinums_for_user(login):
     return cached_count
 
 
+async def run_cache_platinums(send_updates=False, chat_id=None):
+    if _cache_lock.locked():
+        logging.info("Platinum cache run skipped; another cache run is already active")
+        if send_updates and chat_id:
+            await bot.send_message(chat_id, "Cache is already running")
+        return None
+
+    async with _cache_lock:
+        users = list(users_collection.find())
+        if not users:
+            logging.info("Platinum cache run skipped; no tracked users")
+            if send_updates and chat_id:
+                await bot.send_message(chat_id, "No tracked users")
+            return 0
+
+        logging.info("Starting platinum cache run for %s users", len(users))
+        if send_updates and chat_id:
+            await bot.send_message(chat_id, f"Caching platinums for {len(users)} users...")
+
+        total = 0
+        for user_doc in users:
+            login = user_doc["_id"]
+            try:
+                async with _psn_job_lock:
+                    count = await asyncio.to_thread(_cache_platinums_for_user, login)
+                total += count
+                logging.info("Cached %s new platinums for %s", count, login)
+                if send_updates and chat_id:
+                    await bot.send_message(chat_id, f"✓ {login}: {count} new")
+            except Exception as e:
+                logging.error("Error caching platinums for %s: %s", login, e, exc_info=True)
+                if send_updates and chat_id:
+                    await bot.send_message(chat_id, f"✗ {login}: {e}")
+
+        logging.info("Platinum cache run complete; cached %s platinums", total)
+        if send_updates and chat_id:
+            await bot.send_message(chat_id, f"Done — cached {total} platinums")
+        return total
+
+
 @dp.message_handler(commands=["cache"])
 async def cmd_cache(message):
     """Scan all tracked users and cache any uncached platinum trophies (fast — skips already cached)."""
     if message.chat.id != 46051043:
         return
-    users = list(users_collection.find())
-    if not users:
-        await bot.send_message(message.chat.id, "No tracked users")
-        return
-    await bot.send_message(message.chat.id, f"Caching platinums for {len(users)} users...")
-    total = 0
-    for user_doc in users:
-        login = user_doc["_id"]
-        try:
-            count = await asyncio.to_thread(_cache_platinums_for_user, login)
-            total += count
-            await bot.send_message(message.chat.id, f"✓ {login}: {count} new")
-        except Exception as e:
-            logging.error("Error caching platinums for %s: %s", login, e)
-            await bot.send_message(message.chat.id, f"✗ {login}: {e}")
-    await bot.send_message(message.chat.id, f"Done — cached {total} platinums")
+    await run_cache_platinums(send_updates=True, chat_id=message.chat.id)
 
 
 @dp.message_handler(commands=["psn_search"])
@@ -912,6 +1221,35 @@ async def cmd_psn_search(message):
         await bot.send_message(message.chat.id, f"Search error: {e}")
 
 
+@dp.message_handler(commands=["stats"])
+async def cmd_stats(message):
+    """Show DB-backed stats for a tracked PSN username."""
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await bot.send_message(message.chat.id, "Usage: /stats <PSN username>")
+        return
+    login = _resolve_tracked_login(parts[1])
+    if login is None:
+        await bot.send_message(message.chat.id, "User not tracked. Add them first with /add <PSN username>")
+        return
+    stats = _build_user_stats(login)
+    await bot.send_message(message.chat.id, _format_stats(stats))
+
+
+@dp.message_handler(commands=["me"])
+async def cmd_me(message):
+    """Show DB-backed stats for the Telegram user's linked PSN username."""
+    login = _resolve_me_login(message)
+    if login is None:
+        await bot.send_message(
+            message.chat.id,
+            "I don't know your PSN username yet. Use /stats <PSN username>, or run /add <PSN username> once to link it.",
+        )
+        return
+    stats = _build_user_stats(login)
+    await bot.send_message(message.chat.id, _format_stats(stats))
+
+
 @dp.message_handler(commands=["status"])
 async def cmd_status(message):
     """Show online status and current game for all tracked users."""
@@ -939,15 +1277,38 @@ async def background_on_start() -> None:
 
     while True:
         try:
-            await friends_check()
+            async with _psn_job_lock:
+                await friends_check()
         except Exception as e:
             logging.error("Error in friends_check: %s", e, exc_info=True)
         await asyncio.sleep(350 + random.randint(1, 10))
 
 
+def _seconds_until_daily_cache() -> float:
+    now = datetime.now(timezone.utc)
+    next_run = now.replace(hour=DAILY_CACHE_HOUR_UTC, minute=0, second=0, microsecond=0)
+    if next_run <= now:
+        next_run += timedelta(days=1)
+    return (next_run - now).total_seconds()
+
+
+async def daily_cache_on_schedule() -> None:
+    """Run platinum cache once per day without Telegram output."""
+    while True:
+        delay = _seconds_until_daily_cache()
+        logging.info("Next silent platinum cache run in %.0f seconds", delay)
+        await asyncio.sleep(delay)
+        try:
+            await run_cache_platinums(send_updates=False)
+        except Exception as e:
+            logging.error("Error in scheduled platinum cache: %s", e, exc_info=True)
+        await asyncio.sleep(60)
+
+
 async def on_bot_start_up(dispatcher: Dispatcher) -> None:
     """List of actions which should be done before bot start"""
     asyncio.create_task(background_on_start())  # creates background task
+    asyncio.create_task(daily_cache_on_schedule())
 
 
 executor.start_polling(dp, on_startup=on_bot_start_up)
