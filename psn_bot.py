@@ -103,8 +103,8 @@ _callback_store = {}
 _cache_lock = asyncio.Lock()
 _psn_job_lock = asyncio.Lock()
 DAILY_CACHE_HOUR_UTC = 4
-AUTOPOP_PLATINUM_MAX_SECONDS = 60 * 60
-FASTEST_PLATINUM_MIN_SECONDS = 60 * 60
+AUTOPOP_PLATINUM_MAX_SECONDS = 60 * 3
+FASTEST_PLATINUM_MIN_SECONDS = 60 * 3
 
 
 def _store_callback_data(data: str) -> str:
