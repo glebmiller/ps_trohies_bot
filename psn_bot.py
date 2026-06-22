@@ -103,8 +103,8 @@ _callback_store = {}
 _cache_lock = asyncio.Lock()
 _psn_job_lock = asyncio.Lock()
 DAILY_CACHE_HOUR_UTC = 4
-AUTOPOP_PLATINUM_MAX_SECONDS = 60 * 3
-FASTEST_PLATINUM_MIN_SECONDS = 60 * 3
+AUTOPOP_PLATINUM_MAX_SECONDS = 60 * 60
+FASTEST_PLATINUM_MIN_SECONDS = 60 * 60
 
 
 def _store_callback_data(data: str) -> str:
@@ -517,9 +517,12 @@ def _format_timedelta(seconds):
         return None
     days = seconds // 86400
     hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
     if days:
         return f"{days}d {hours}h"
-    return f"{hours}h"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{max(1, minutes)}m"
 
 
 def _build_user_stats(login):
